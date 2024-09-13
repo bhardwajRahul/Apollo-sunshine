@@ -46,6 +46,18 @@ namespace nvhttp {
   namespace fs = std::filesystem;
   namespace pt = boost::property_tree;
 
+  struct named_cert_t {
+    std::string name;
+    std::string uuid;
+    std::string cert;
+  };
+
+  struct client_t {
+    std::vector<named_cert_t> named_devices;
+  };
+
+  struct pair_session_t;
+
   crypto::cert_chain_t cert_chain;
   static std::string one_time_pin;
   static std::string otp_passphrase;
@@ -66,6 +78,15 @@ namespace nvhttp {
 
   class SunshineHTTPSServer: public SimpleWeb::ServerBase<SunshineHTTPS> {
   public:
+    class ApolloSession: public Session {
+      public:
+      bool verified = false;
+      named_cert_t* named_cert = nullptr;
+      void* userp = nullptr;
+
+      template<typename ...Args>
+      ApolloSession(Args&&... args): Session(std::forward<Args>(args)...) {}
+    };
     SunshineHTTPSServer(const std::string &certification_file, const std::string &private_key_file):
         ServerBase<SunshineHTTPS>::ServerBase(443),
         context(boost::asio::ssl::context::tls_server) {
@@ -76,7 +97,7 @@ namespace nvhttp {
       context.use_private_key_file(private_key_file, boost::asio::ssl::context::pem);
     }
 
-    std::function<int(SSL *)> verify;
+    std::function<bool(ApolloSession*, SSL*)> verify;
     std::function<void(std::shared_ptr<Response>, std::shared_ptr<Request>)> on_verify_failed;
 
   protected:
@@ -106,7 +127,7 @@ namespace nvhttp {
         if (ec != SimpleWeb::error::operation_aborted)
           this->accept();
 
-        auto session = std::make_shared<Session>(config.max_request_streambuf_size, connection);
+        auto session = std::make_shared<ApolloSession>(config.max_request_streambuf_size, connection);
 
         if (!ec) {
           boost::asio::ip::tcp::no_delay option(true);
@@ -120,7 +141,7 @@ namespace nvhttp {
             if (!lock)
               return;
             if (!ec) {
-              if (verify && !verify(session->connection->socket->native_handle()))
+              if (verify && !verify(session.get(), session->connection->socket->native_handle()))
                 this->write(session, on_verify_failed);
               else
                 this->read(session);
@@ -137,21 +158,12 @@ namespace nvhttp {
 
   using https_server_t = SunshineHTTPSServer;
   using http_server_t = SimpleWeb::Server<SimpleWeb::HTTP>;
+  using https_session_t = SunshineHTTPSServer::ApolloSession;
 
   struct conf_intern_t {
     std::string servercert;
     std::string pkey;
   } conf_intern;
-
-  struct named_cert_t {
-    std::string name;
-    std::string uuid;
-    std::string cert;
-  };
-
-  struct client_t {
-    std::vector<named_cert_t> named_devices;
-  };
 
   struct pair_session_t {
     struct {
@@ -1143,21 +1155,19 @@ namespace nvhttp {
     http_server_t http_server;
 
     // Verify certificates after establishing connection
-    https_server.verify = [add_cert](SSL *ssl) {
+    https_server.verify = [add_cert](https_session_t* session, SSL *ssl) {
       crypto::x509_t x509 { SSL_get_peer_certificate(ssl) };
       if (!x509) {
         BOOST_LOG(info) << "unknown -- denied"sv;
-        return 0;
+        return false;
       }
-
-      int verified = 0;
 
       auto fg = util::fail_guard([&]() {
         char subject_name[256];
 
         X509_NAME_oneline(X509_get_subject_name(x509.get()), subject_name, sizeof(subject_name));
 
-        BOOST_LOG(debug) << subject_name << " -- "sv << (verified ? "verified"sv : "denied"sv);
+        BOOST_LOG(debug) << subject_name << " -- "sv << (session->verified ? "verified"sv : "denied"sv);
       });
 
       while (add_cert->peek()) {
@@ -1174,12 +1184,12 @@ namespace nvhttp {
       if (err_str) {
         BOOST_LOG(warning) << "SSL Verification error :: "sv << err_str;
 
-        return verified;
+        return session->verified;
       }
 
-      verified = 1;
+      session->verified = true;
 
-      return verified;
+      return session->verified;
     };
 
     https_server.on_verify_failed = [](resp_https_t resp, req_https_t req) {
